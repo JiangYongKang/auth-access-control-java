@@ -19,7 +19,8 @@ import org.springframework.stereotype.Service;
  * <pre>
  *   结构非法 → MALFORMED_TOKEN
  *   头部 alg 不受支持 → UNSUPPORTED_ALG
- *   签名不匹配（含被篡改） → BAD_SIGNATURE
+ *   头部 kid 在配置中不存在（不认识/已摘除） → UNKNOWN_SIGNING_KEY
+ *   kid 认识但签名不匹配（含被篡改） → BAD_SIGNATURE
  *   载荷解析失败/缺少必需声明 → MALFORMED_TOKEN / MISSING_CLAIMS
  *   已过期 → TOKEN_EXPIRED
  *   签发者不符 → TOKEN_ISSUER_MISMATCH
@@ -46,8 +47,12 @@ public class AccessTokenService {
 
     public String issue(AccessTokenClaims claims) {
         try {
-            String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-            String headerB64 = b64url(header);
+            // 多密钥轮换模式下头部带 kid，供验签时定位具体密钥；旧式单密钥模式不带 kid。
+            String headerJson = signer.keyRing().isMultiKey()
+                    ? JsonCodec.mapper().writeValueAsString(java.util.Map.of(
+                            "alg", "HS256", "typ", "JWT", "kid", signer.keyRing().activeKeyId()))
+                    : "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+            String headerB64 = b64url(headerJson);
             String payloadB64 = b64url(JsonCodec.mapper().writeValueAsString(claims));
             String signingInput = headerB64 + "." + payloadB64;
             byte[] sig = signer.sign(signingInput.getBytes(StandardCharsets.UTF_8));
@@ -80,6 +85,16 @@ public class AccessTokenService {
             throw new RejectException(RejectReason.UNSUPPORTED_ALG,
                     "unsupported or missing alg: " + alg);
         }
+        // kid 缺省（旧式令牌）允许；一旦出现就必须是非空字符串。
+        JsonNode kidNode = header.get("kid");
+        String kid = null;
+        if (kidNode != null && !kidNode.isNull()) {
+            if (!kidNode.isTextual() || kidNode.asText().isBlank()) {
+                throw new RejectException(RejectReason.MALFORMED_TOKEN,
+                        "header claim 'kid' must be a non-empty string when present");
+            }
+            kid = kidNode.asText();
+        }
 
         String signingInput = parts[0] + "." + parts[1];
         byte[] providedSig;
@@ -88,7 +103,15 @@ public class AccessTokenService {
         } catch (IllegalArgumentException e) {
             throw new RejectException(RejectReason.MALFORMED_TOKEN, "signature segment is not base64url");
         }
-        if (!signer.verify(signingInput.getBytes(StandardCharsets.UTF_8), providedSig)) {
+        SigningKeyRing.SignatureCheck signatureCheck =
+                signer.verifyWithKid(signingInput.getBytes(StandardCharsets.UTF_8), providedSig, kid);
+        if (signatureCheck == SigningKeyRing.SignatureCheck.KEY_NOT_FOUND) {
+            // 令牌由不认识的/已从配置摘除的密钥签发——与签名本身对不上明确区分开。
+            log.info("Access token rejected: signing key is not configured (kid is unknown or removed)");
+            throw new RejectException(RejectReason.UNKNOWN_SIGNING_KEY,
+                    "token was signed by a key that is not present in the current configuration");
+        }
+        if (signatureCheck == SigningKeyRing.SignatureCheck.SIGNATURE_MISMATCH) {
             log.debug("Access token rejected: signature verification failed");
             throw new RejectException(RejectReason.BAD_SIGNATURE,
                     "signature does not match (token may have been tampered with)");

@@ -183,9 +183,17 @@ public class TokenAuthService {
                     "access token is not from the current family generation (" + status + ")");
         }
 
+        // 记录会话最近使用时间（仅用于会话概览展示，不影响任何安全结论）。
+        refreshTokenStore.touch(claims.fam(), clock.epochSeconds());
+
         return new CurrentPrincipal(claims.sub(), claims.clientId(),
                 new HashSet<>(claims.roles()), new HashSet<>(claims.scopes()),
                 claims.jti(), claims.gen());
+    }
+
+    /** 供自检/撤销等管理端点认证调用方客户端。 */
+    public void requireClient(String clientId, String clientSecret) {
+        authenticateClient(clientId, clientSecret);
     }
 
     private ClientApp authenticateClient(String clientId, String clientSecret) {

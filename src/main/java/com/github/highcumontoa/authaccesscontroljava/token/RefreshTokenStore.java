@@ -1,5 +1,6 @@
 package com.github.highcumontoa.authaccesscontroljava.token;
 
+import java.util.List;
 import java.util.Optional;
 
 public interface RefreshTokenStore {
@@ -18,6 +19,21 @@ public interface RefreshTokenStore {
 
     /** 访问令牌校验时查询族代际状态。 */
     FamilyStatus familyStatus(String familyId, long generation);
+
+    /**
+     * 记录某会话「最近使用时间」（仅用于会话概览展示，不参与安全判定）。
+     * 实现可对落盘做节流，以避免每个 API 请求都写盘。
+     */
+    void touch(String familyId, long epochSeconds);
+
+    /** 列出某主体当前「有效」的会话（未撤销、未过期）。 */
+    List<RefreshFamily> listActiveSessions(String subject);
+
+    /**
+     * 注销某主体名下全部有效会话（撤销其全部有效族）。
+     * @return 实际被注销的会话数量
+     */
+    int revokeSessionsBySubject(String subject, String reason);
 
     record StoredToken(String rawToken, String familyId, long generation) {
     }

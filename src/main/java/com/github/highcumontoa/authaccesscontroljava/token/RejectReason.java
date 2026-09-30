@@ -12,12 +12,16 @@ public enum RejectReason {
     MALFORMED_TOKEN(HttpStatus.UNAUTHORIZED, "malformed_token"),
     UNSUPPORTED_ALG(HttpStatus.UNAUTHORIZED, "unsupported_alg"),
     BAD_SIGNATURE(HttpStatus.UNAUTHORIZED, "bad_signature"),
+    /** 令牌声称由某个 kid 签发，但该 kid 不在当前配置中（不认识或已摘除）：立即拒绝。 */
+    UNKNOWN_SIGNING_KEY(HttpStatus.UNAUTHORIZED, "unknown_signing_key"),
     MISSING_CLAIMS(HttpStatus.UNAUTHORIZED, "missing_claims"),
     TOKEN_EXPIRED(HttpStatus.UNAUTHORIZED, "token_expired"),
     TOKEN_ISSUER_MISMATCH(HttpStatus.UNAUTHORIZED, "token_issuer_mismatch"),
     TOKEN_SUBJECT_MISMATCH(HttpStatus.UNAUTHORIZED, "token_subject_mismatch"),
     TOKEN_FAMILY_REVOKED(HttpStatus.UNAUTHORIZED, "token_family_revoked"),
     TOKEN_FAMILY_STALE(HttpStatus.UNAUTHORIZED, "token_family_stale"),
+    /** 定向注销时找不到目标会话（不存在、已过期或已注销）。 */
+    SESSION_NOT_FOUND(HttpStatus.NOT_FOUND, "session_not_found"),
 
     // 令牌端点：凭据/授权相关
     INVALID_REQUEST(HttpStatus.BAD_REQUEST, "invalid_request"),

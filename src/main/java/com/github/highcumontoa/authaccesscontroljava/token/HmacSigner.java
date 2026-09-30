@@ -4,64 +4,63 @@ import com.github.highcumontoa.authaccesscontroljava.config.AuthProperties;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
- * HMAC-SHA256 签名器。
+ * HMAC-SHA256 签名器：薄封装，真正的多密钥选择/轮换逻辑在 {@link SigningKeyRing}。
  *
  * <p>密钥来源只有两种，均不落盘：
  * <ol>
- *   <li>配置 {@code auth.security.hmac-key}（生产应通过环境变量 AUTH_HMAC_KEY 注入）；</li>
- *   <li>配置缺失时，在进程内存中用 {@link SecureRandom} 生成一次性随机密钥，
+ *   <li>配置：多密钥 {@code auth.security.keys} + {@code auth.security.active-key-id}（轮换模式），
+ *       或旧式单密钥 {@code auth.security.hmac-key}（兼容模式，推荐改用 AUTH_HMAC_KEY 注入）；</li>
+ *   <li>配置缺失时，由 {@link SigningKeyRing} 在进程内存中用 SecureRandom 生成一次性随机密钥，
  *       进程结束即消失——重启后旧令牌必然验签失败，属可解释的预期行为。</li>
  * </ol>
  */
 @Component
 public class HmacSigner {
 
-    private static final Logger log = LoggerFactory.getLogger(HmacSigner.class);
     private static final String HMAC_SHA256 = "HmacSHA256";
-    private static final int EPHEMERAL_KEY_BYTES = 32;
 
-    private final byte[] key;
-    private final boolean ephemeral;
+    private final SigningKeyRing keyRing;
 
+    @Autowired
     public HmacSigner(AuthProperties props) {
-        String configured = props.getSecurity().getHmacKey();
-        if (configured != null && !configured.isBlank()) {
-            this.key = configured.getBytes(StandardCharsets.UTF_8);
-            this.ephemeral = false;
-            log.info("HMAC signing key loaded from configuration (length={}, fp={})",
-                    key.length, com.github.highcumontoa.authaccesscontroljava.support.Maskers.fingerprint(configured));
-        } else {
-            this.key = new byte[EPHEMERAL_KEY_BYTES];
-            new SecureRandom().nextBytes(this.key);
-            this.ephemeral = true;
-            log.warn("auth.security.hmac-key is not configured; generated an EPHEMERAL in-memory key. "
-                    + "Tokens will not survive a process restart. Set AUTH_HMAC_KEY for stable verification.");
-        }
+        this(new SigningKeyRing(props.getSecurity()));
+    }
+
+    public HmacSigner(SigningKeyRing keyRing) {
+        this.keyRing = keyRing;
+    }
+
+    public SigningKeyRing keyRing() {
+        return keyRing;
     }
 
     public boolean isEphemeral() {
-        return ephemeral;
+        return keyRing.isEphemeral();
     }
 
+    /** 用当前活动密钥签名。 */
     public byte[] sign(byte[] data) {
-        return newMac(key).doFinal(data);
+        return keyRing.signActive(data);
     }
 
-    /** 常量时间比较，避免签名比对的计时侧信道。 */
+    /**
+     * 旧式无 kid 验签（兼容入口）：按头部无 kid 的令牌处理，回退到唯一/活动密钥。
+     * 多密钥模式下应使用 {@link #verifyWithKid(byte[], byte[], String)} 以便区分
+     * 「密钥未知/已摘除」与「签名对不上」。
+     */
     public boolean verify(byte[] data, byte[] signature) {
-        if (signature == null) {
-            return false;
-        }
-        byte[] expected = sign(data);
-        return MessageDigest.isEqual(expected, signature);
+        return keyRing.verify(data, signature, null) == SigningKeyRing.SignatureCheck.MATCHED;
+    }
+
+    /** 按令牌头部 kid 选择密钥验签，返回可区分的三态结论。 */
+    public SigningKeyRing.SignatureCheck verifyWithKid(byte[] data, byte[] signature, String tokenKid) {
+        return keyRing.verify(data, signature, tokenKid);
     }
 
     public static byte[] sha256(byte[] data) {

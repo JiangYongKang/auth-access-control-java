@@ -28,6 +28,11 @@ public class RefreshFamily {
     private String revokeReason;
     private List<String> roles;
     private List<String> scopes;
+    /**
+     * 最近一次「使用」该会话的大致时间（访问令牌通过认证 / 刷新）。
+     * 仅为会话概览而记录，不参与任何安全判定；持久化为秒级时间戳，不落任何令牌原文。
+     */
+    private long lastUsedAt;
 
     public RefreshFamily() {
     }
@@ -68,4 +73,7 @@ public class RefreshFamily {
 
     public List<String> getScopes() { return scopes == null ? List.of() : scopes; }
     public void setScopes(List<String> scopes) { this.scopes = scopes; }
+
+    public long getLastUsedAt() { return lastUsedAt; }
+    public void setLastUsedAt(long lastUsedAt) { this.lastUsedAt = lastUsedAt; }
 }

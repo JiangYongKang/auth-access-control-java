@@ -35,6 +35,8 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
 
     private static final Logger log = LoggerFactory.getLogger(FileRefreshTokenStore.class);
     private static final SecureRandom RANDOM = new SecureRandom();
+    /** lastUsedAt 落盘节流间隔：距上次持久化不足该秒数时只更新内存，避免每个请求都写盘。 */
+    private static final long TOUCH_PERSIST_INTERVAL_SECONDS = 60L;
 
     private final Path stateFile;
     private final Clock clock;
@@ -103,6 +105,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         family.setRevoked(false);
         family.setRoles(java.util.List.copyOf(roles));
         family.setScopes(java.util.List.copyOf(scopes));
+        family.setLastUsedAt(now);
         families.put(familyId, family);
         persistLocked();
         log.info("Refresh family created: family={}, subject={}, client={}, ttl={}s",
@@ -149,6 +152,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         String nextRaw = mintRawToken(familyId);
         family.setCurrentTokenHash(hashToken(nextRaw));
         family.setGeneration(family.getGeneration() + 1);
+        family.setLastUsedAt(now);
         persistLocked();
         log.info("Refresh rotated successfully: family={}, newGen={}", familyId, family.getGeneration());
         return new RotationResult(RotationOutcome.SUCCESS, family,
@@ -191,6 +195,57 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         return family.getGeneration() == generation
                 ? FamilyStatus.ACTIVE_CURRENT
                 : FamilyStatus.ACTIVE_STALE;
+    }
+
+    @Override
+    public synchronized void touch(String familyId, long epochSeconds) {
+        RefreshFamily family = families.get(familyId);
+        if (family == null || family.isRevoked()) {
+            return;
+        }
+        if (epochSeconds <= family.getLastUsedAt()) {
+            return;
+        }
+        boolean shouldPersist =
+                epochSeconds - family.getLastUsedAt() >= TOUCH_PERSIST_INTERVAL_SECONDS;
+        family.setLastUsedAt(epochSeconds);
+        if (shouldPersist) {
+            persistLocked();
+        }
+    }
+
+    @Override
+    public synchronized List<RefreshFamily> listActiveSessions(String subject) {
+        long now = clock.epochSeconds();
+        return families.values().stream()
+                .filter(f -> subject.equals(f.getSubject()))
+                .filter(f -> !f.isRevoked() && !f.isExpiredAt(now))
+                .sorted(java.util.Comparator.comparingLong(RefreshFamily::getIssuedAt))
+                .toList();
+    }
+
+    @Override
+    public synchronized int revokeSessionsBySubject(String subject, String reason) {
+        long now = clock.epochSeconds();
+        int count = 0;
+        boolean changed = false;
+        for (RefreshFamily family : families.values()) {
+            if (!subject.equals(family.getSubject())) {
+                continue;
+            }
+            if (family.isRevoked() || family.isExpiredAt(now)) {
+                continue;
+            }
+            family.setRevoked(true);
+            family.setRevokeReason(reason == null ? "session_logout" : reason);
+            changed = true;
+            count++;
+        }
+        if (changed) {
+            persistLocked();
+            log.info("All sessions revoked for subject={}, count={}, reason={}", subject, count, reason);
+        }
+        return count;
     }
 
     /** 刷新令牌原文格式：{@code <familyId>.<32字节随机hex>}；familyId 部分只用于定位族，无敏感性。 */
