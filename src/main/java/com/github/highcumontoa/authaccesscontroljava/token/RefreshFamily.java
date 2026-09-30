@@ -1,5 +1,6 @@
 package com.github.highcumontoa.authaccesscontroljava.token;
 
+import com.github.highcumontoa.authaccesscontroljava.session.SessionLogoutReason;
 import java.util.List;
 
 /**
@@ -26,6 +27,8 @@ public class RefreshFamily {
     private long expiresAt;
     private boolean revoked;
     private String revokeReason;
+    private long lastUsedAt;
+    private SessionLogoutReason logoutReason = SessionLogoutReason.NONE;
     private List<String> roles;
     private List<String> scopes;
 
@@ -62,6 +65,14 @@ public class RefreshFamily {
 
     public String getRevokeReason() { return revokeReason; }
     public void setRevokeReason(String revokeReason) { this.revokeReason = revokeReason; }
+
+    public long getLastUsedAt() { return lastUsedAt; }
+    public void setLastUsedAt(long lastUsedAt) { this.lastUsedAt = lastUsedAt; }
+
+    public SessionLogoutReason getLogoutReason() {
+        return logoutReason == null ? SessionLogoutReason.NONE : logoutReason;
+    }
+    public void setLogoutReason(SessionLogoutReason logoutReason) { this.logoutReason = logoutReason; }
 
     public List<String> getRoles() { return roles == null ? List.of() : roles; }
     public void setRoles(List<String> roles) { this.roles = roles; }

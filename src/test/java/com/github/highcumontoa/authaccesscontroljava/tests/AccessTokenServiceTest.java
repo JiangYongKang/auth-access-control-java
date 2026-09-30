@@ -11,6 +11,7 @@ import com.github.highcumontoa.authaccesscontroljava.token.AccessTokenService;
 import com.github.highcumontoa.authaccesscontroljava.token.HmacSigner;
 import com.github.highcumontoa.authaccesscontroljava.token.RejectException;
 import com.github.highcumontoa.authaccesscontroljava.token.RejectReason;
+import com.github.highcumontoa.authaccesscontroljava.token.SigningKeyRing;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
@@ -49,13 +50,20 @@ class AccessTokenServiceTest {
         AuthProperties props = new AuthProperties();
         props.getSecurity().setHmacKey("unit-test-hmac-key-0123456789");
         props.getSecurity().setIssuer(ISSUER);
-        service = new AccessTokenService(new HmacSigner(props), clock);
+        service = new AccessTokenService(new SigningKeyRing(props), clock);
+    }
+
+    private static SigningKeyRing ringWith(String keyId, String secret) {
+        AuthProperties props = new AuthProperties();
+        props.getSecurity().getSigningKeys().put(keyId, secret);
+        props.getSecurity().setActiveKeyId(keyId);
+        return new SigningKeyRing(props);
     }
 
     private AccessTokenClaims claims() {
         return new AccessTokenClaims(ISSUER, "u-alice", "local-resource-api", "jti-1",
                 "client-web", "fam-1", now, now + 600, 0L,
-                List.of("USER"), List.of("read"));
+                List.of("USER"), List.of("read"), SigningKeyRing.LEGACY_KEY_ID);
     }
 
     @Test
@@ -150,10 +158,10 @@ class AccessTokenServiceTest {
 
     @Test
     void missingRequiredClaimIsRejected() throws Exception {
-        // 构造一个签名合法但缺少 fam 声明的令牌（直接用签名器手动签发）
+        // 构造一个签名合法但缺少 fam 声明的令牌（直接用当前密钥手动签发）
         AuthProperties props = new AuthProperties();
         props.getSecurity().setHmacKey("unit-test-hmac-key-0123456789");
-        HmacSigner signer = new HmacSigner(props);
+        SigningKeyRing signerRing = new SigningKeyRing(props);
 
         String headerB64 = Base64.getUrlEncoder().withoutPadding()
                 .encodeToString("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes());
@@ -170,7 +178,8 @@ class AccessTokenServiceTest {
                 .encodeToString(JsonCodec.mapper().writeValueAsBytes(incomplete));
         String input = headerB64 + "." + payloadB64;
         String sig = Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(signer.sign(input.getBytes()));
+                .encodeToString(HmacSigner.newMac(signerRing.activeKey().secret())
+                        .doFinal(input.getBytes()));
         String token = input + "." + sig;
 
         assertThatThrownBy(() -> service.verify(token, ISSUER))
@@ -188,13 +197,21 @@ class AccessTokenServiceTest {
 
     @Test
     void tokenSignedByAnotherKeyIsRejectedAsBadSignature() {
-        AuthProperties otherProps = new AuthProperties();
-        otherProps.getSecurity().setHmacKey("a-totally-different-key-999");
-        AccessTokenService otherService =
-                new AccessTokenService(new HmacSigner(otherProps), clock);
-        String foreignToken = otherService.issue(claims());
+        // 两把密钥都保留在环中：kid 能找到密钥，但签名是另一把密钥算出来的 → bad_signature。
+        AuthProperties ringProps = new AuthProperties();
+        ringProps.getSecurity().getSigningKeys().put("k1", "unit-test-hmac-key-0123456789");
+        // 同样叫 k2，但密钥值与签发方不同：kid 可识别，签名却对不上。
+        ringProps.getSecurity().getSigningKeys().put("k2", "yet-another-secret-value-777");
+        ringProps.getSecurity().setActiveKeyId("k1");
+        AccessTokenService ringService = new AccessTokenService(new SigningKeyRing(ringProps), clock);
 
-        assertThatThrownBy(() -> service.verify(foreignToken, ISSUER))
+        AuthProperties foreignProps = new AuthProperties();
+        foreignProps.getSecurity().getSigningKeys().put("k2", "a-totally-different-key-999");
+        foreignProps.getSecurity().setActiveKeyId("k2");
+        AccessTokenService foreignService = new AccessTokenService(new SigningKeyRing(foreignProps), clock);
+        String foreignToken = foreignService.issue(claims());
+
+        assertThatThrownBy(() -> ringService.verify(foreignToken, ISSUER))
                 .isInstanceOfSatisfying(RejectException.class,
                         ex -> assertThat(ex.reason()).isEqualTo(RejectReason.BAD_SIGNATURE));
     }

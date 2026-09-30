@@ -19,12 +19,14 @@ import org.springframework.stereotype.Service;
  * <pre>
  *   结构非法 → MALFORMED_TOKEN
  *   头部 alg 不受支持 → UNSUPPORTED_ALG
- *   签名不匹配（含被篡改） → BAD_SIGNATURE
+ *   kid 对应密钥已摘除/未配置 → UNKNOWN_SIGNING_KEY（与下面的签名不匹配明确分开）
+ *   签名不匹配（密钥仍在，但载荷/签名被篡改） → BAD_SIGNATURE
  *   载荷解析失败/缺少必需声明 → MALFORMED_TOKEN / MISSING_CLAIMS
  *   已过期 → TOKEN_EXPIRED
  *   签发者不符 → TOKEN_ISSUER_MISMATCH
  * </pre>
- */
+ * 头部含 {@code kid}，标识签发所用密钥；无 kid 的旧令牌按兼容密钥 id "default" 处理。
+ * */
 @Service
 public class AccessTokenService {
 
@@ -34,23 +36,27 @@ public class AccessTokenService {
     private static final Set<String> REQUIRED_CLAIMS =
             Set.of("iss", "sub", "jti", "iat", "exp", "clientId", "fam", "gen");
 
-    private final HmacSigner signer;
+    private final SigningKeyRing keyRing;
     private final Clock clock;
     private final Base64.Encoder b64url = Base64.getUrlEncoder().withoutPadding();
     private final Base64.Decoder b64urlDecoder = Base64.getUrlDecoder();
 
-    public AccessTokenService(HmacSigner signer, Clock clock) {
-        this.signer = signer;
+    public AccessTokenService(SigningKeyRing keyRing, Clock clock) {
+        this.keyRing = keyRing;
         this.clock = clock;
     }
 
     public String issue(AccessTokenClaims claims) {
         try {
-            String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+            // 签发始终使用密钥环当前密钥，kid 也以当前密钥为准（不信任外部传入值）。
+            SigningKey active = keyRing.activeKey();
+            String header = JsonCodec.mapper().writeValueAsString(
+                    java.util.Map.of("alg", "HS256", "typ", "JWT", "kid", active.id()));
             String headerB64 = b64url(header);
             String payloadB64 = b64url(JsonCodec.mapper().writeValueAsString(claims));
             String signingInput = headerB64 + "." + payloadB64;
-            byte[] sig = signer.sign(signingInput.getBytes(StandardCharsets.UTF_8));
+            byte[] sig = HmacSigner.newMac(active.secret())
+                    .doFinal(signingInput.getBytes(StandardCharsets.UTF_8));
             String sigB64 = b64url.encodeToString(sig);
             return signingInput + "." + sigB64;
         } catch (Exception e) {
@@ -88,7 +94,15 @@ public class AccessTokenService {
         } catch (IllegalArgumentException e) {
             throw new RejectException(RejectReason.MALFORMED_TOKEN, "signature segment is not base64url");
         }
-        if (!signer.verify(signingInput.getBytes(StandardCharsets.UTF_8), providedSig)) {
+        String kid = header.path("kid").asText(null);
+        SigningKeyRing.VerifyResult signatureResult =
+                keyRing.verify(kid, signingInput.getBytes(StandardCharsets.UTF_8), providedSig);
+        if (signatureResult == SigningKeyRing.VerifyResult.UNKNOWN_KEY) {
+            log.debug("Access token rejected: signed by unknown/removed key kid={}", kid);
+            throw new RejectException(RejectReason.UNKNOWN_SIGNING_KEY,
+                    "token was signed by a key that is not configured (kid=" + kid + ")");
+        }
+        if (signatureResult != SigningKeyRing.VerifyResult.VALID) {
             log.debug("Access token rejected: signature verification failed");
             throw new RejectException(RejectReason.BAD_SIGNATURE,
                     "signature does not match (token may have been tampered with)");
@@ -129,7 +143,8 @@ public class AccessTokenService {
                 exp,
                 payload.get("gen").asLong(),
                 readStringList(payload, "roles"),
-                readStringList(payload, "scopes"));
+                readStringList(payload, "scopes"),
+                kid);
     }
 
     private JsonNode decodeJson(String b64, RejectReason malformedReason, String message) {

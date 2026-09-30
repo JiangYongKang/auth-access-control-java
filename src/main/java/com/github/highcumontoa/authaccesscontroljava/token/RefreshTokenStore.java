@@ -1,5 +1,7 @@
 package com.github.highcumontoa.authaccesscontroljava.token;
 
+import com.github.highcumontoa.authaccesscontroljava.session.SessionLogoutReason;
+import java.util.List;
 import java.util.Optional;
 
 public interface RefreshTokenStore {
@@ -19,6 +21,18 @@ public interface RefreshTokenStore {
     /** 访问令牌校验时查询族代际状态。 */
     FamilyStatus familyStatus(String familyId, long generation);
 
+    /** 列出某主体名下的全部族（含已注销/已过期），按建立时间升序。 */
+    List<RefreshFamily> listBySubject(String subject);
+
+    /** 定向注销单个会话（族）。返回该族是否存在且此前处于有效状态。 */
+    boolean logoutSession(String familyId, SessionLogoutReason reason);
+
+    /** 注销某主体名下当前所有有效会话，返回被注销的会话数。 */
+    int logoutAllBySubject(String subject, SessionLogoutReason reason);
+
+    /** 记录一次会话使用（更新 lastUsedAt）；允许合并/节流落盘，不影响任何校验结论。 */
+    void touch(String familyId, long epochSeconds);
+
     record StoredToken(String rawToken, String familyId, long generation) {
     }
 
@@ -27,5 +41,5 @@ public interface RefreshTokenStore {
     record RotationResult(RotationOutcome outcome, RefreshFamily family, StoredToken nextToken) {
     }
 
-    enum FamilyStatus { ACTIVE_CURRENT, ACTIVE_STALE, REVOKED, UNKNOWN }
+    enum FamilyStatus { ACTIVE_CURRENT, ACTIVE_STALE, REVOKED, LOGGED_OUT, UNKNOWN }
 }

@@ -18,6 +18,8 @@ public enum RejectReason {
     TOKEN_SUBJECT_MISMATCH(HttpStatus.UNAUTHORIZED, "token_subject_mismatch"),
     TOKEN_FAMILY_REVOKED(HttpStatus.UNAUTHORIZED, "token_family_revoked"),
     TOKEN_FAMILY_STALE(HttpStatus.UNAUTHORIZED, "token_family_stale"),
+    TOKEN_SESSION_LOGGED_OUT(HttpStatus.UNAUTHORIZED, "token_session_logged_out"),
+    UNKNOWN_SIGNING_KEY(HttpStatus.UNAUTHORIZED, "unknown_signing_key"),
 
     // 令牌端点：凭据/授权相关
     INVALID_REQUEST(HttpStatus.BAD_REQUEST, "invalid_request"),
@@ -38,7 +40,10 @@ public enum RejectReason {
     FORBIDDEN_OWNER(HttpStatus.FORBIDDEN, "forbidden_owner"),
 
     // 限流
-    RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS, "rate_limited");
+    RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS, "rate_limited"),
+
+    // 会话管理
+    SESSION_NOT_FOUND(HttpStatus.NOT_FOUND, "session_not_found");
 
     private final HttpStatus httpStatus;
     private final String errorCode;

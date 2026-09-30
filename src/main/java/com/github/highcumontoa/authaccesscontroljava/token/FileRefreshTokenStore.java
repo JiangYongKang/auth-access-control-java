@@ -35,10 +35,13 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
 
     private static final Logger log = LoggerFactory.getLogger(FileRefreshTokenStore.class);
     private static final SecureRandom RANDOM = new SecureRandom();
+    /** lastUsedAt 这类非关键时间戳的落盘节流窗口（秒）。 */
+    private static final long TOUCH_FLUSH_INTERVAL_SECONDS = 5;
 
     private final Path stateFile;
     private final Clock clock;
     private final Map<String, RefreshFamily> families = new HashMap<>();
+    private long lastTouchFlushAt = Long.MIN_VALUE;
 
     public FileRefreshTokenStore(AuthProperties props, Clock clock) {
         this.stateFile = Path.of(props.getToken().getStateFile());
@@ -101,6 +104,8 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         family.setIssuedAt(now);
         family.setExpiresAt(now + ttlSeconds);
         family.setRevoked(false);
+        family.setLastUsedAt(now);
+        family.setLogoutReason(com.github.highcumontoa.authaccesscontroljava.session.SessionLogoutReason.NONE);
         family.setRoles(java.util.List.copyOf(roles));
         family.setScopes(java.util.List.copyOf(scopes));
         families.put(familyId, family);
@@ -149,6 +154,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         String nextRaw = mintRawToken(familyId);
         family.setCurrentTokenHash(hashToken(nextRaw));
         family.setGeneration(family.getGeneration() + 1);
+        family.setLastUsedAt(clock.epochSeconds());
         persistLocked();
         log.info("Refresh rotated successfully: family={}, newGen={}", familyId, family.getGeneration());
         return new RotationResult(RotationOutcome.SUCCESS, family,
@@ -165,6 +171,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         if (!family.isRevoked()) {
             family.setRevoked(true);
             family.setRevokeReason(reason == null ? "explicit_revoke" : reason);
+            family.setLogoutReason(com.github.highcumontoa.authaccesscontroljava.session.SessionLogoutReason.TOKEN_REVOKED);
             persistLocked();
             log.info("Refresh family revoked: family={}, reason={}", familyId, family.getRevokeReason());
         }
@@ -182,7 +189,11 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
             return FamilyStatus.UNKNOWN;
         }
         if (family.isRevoked()) {
-            return FamilyStatus.REVOKED;
+            // 区分"会话被注销"与"令牌/族被撤销"：二者在校验错误码与自检原因上必须分开。
+            return switch (family.getLogoutReason()) {
+                case SESSION_REVOKED, ALL_SESSIONS_REVOKED -> FamilyStatus.LOGGED_OUT;
+                default -> FamilyStatus.REVOKED;
+            };
         }
         if (family.isExpiredAt(clock.epochSeconds())) {
             // 族已过期等同于状态不可再确认，按"非当前"处理。
@@ -191,6 +202,77 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         return family.getGeneration() == generation
                 ? FamilyStatus.ACTIVE_CURRENT
                 : FamilyStatus.ACTIVE_STALE;
+    }
+
+    @Override
+    public synchronized List<RefreshFamily> listBySubject(String subject) {
+        List<RefreshFamily> result = new java.util.ArrayList<>();
+        for (RefreshFamily family : families.values()) {
+            if (subject.equals(family.getSubject())) {
+                result.add(family);
+            }
+        }
+        result.sort(java.util.Comparator.comparingLong(RefreshFamily::getIssuedAt));
+        return List.copyOf(result);
+    }
+
+    @Override
+    public synchronized boolean logoutSession(String familyId,
+                                              com.github.highcumontoa.authaccesscontroljava.session.SessionLogoutReason reason) {
+        RefreshFamily family = families.get(familyId);
+        if (family == null) {
+            log.info("Session logout requested for unknown session: {}", familyId);
+            return false;
+        }
+        if (family.isRevoked()) {
+            // 已经注销/撤销：幂等视为"没有新的有效会话被关闭"。
+            return false;
+        }
+        family.setRevoked(true);
+        family.setLogoutReason(reason);
+        family.setRevokeReason("session_logout:" + reason.name());
+        flushTouchLocked();
+        log.info("Session logged out: family={}, reason={}", familyId, reason);
+        return true;
+    }
+
+    @Override
+    public synchronized int logoutAllBySubject(String subject,
+                                               com.github.highcumontoa.authaccesscontroljava.session.SessionLogoutReason reason) {
+        int count = 0;
+        long now = clock.epochSeconds();
+        for (RefreshFamily family : families.values()) {
+            if (subject.equals(family.getSubject()) && !family.isRevoked() && !family.isExpiredAt(now)) {
+                family.setRevoked(true);
+                family.setLogoutReason(reason);
+                family.setRevokeReason("logout_all_sessions:" + reason.name());
+                count++;
+            }
+        }
+        if (count > 0) {
+            flushTouchLocked();
+        }
+        log.info("Logged out all sessions for subject={}, count={}, reason={}", subject, count, reason);
+        return count;
+    }
+
+    @Override
+    public synchronized void touch(String familyId, long epochSeconds) {
+        RefreshFamily family = families.get(familyId);
+        if (family == null || family.isRevoked() || family.getLastUsedAt() >= epochSeconds) {
+            return;
+        }
+        family.setLastUsedAt(epochSeconds);
+        // 访问可能非常频繁：仅在距上次落盘超过节流窗口时写盘；注销/轮换等关键状态仍会立即落盘。
+        if (epochSeconds - lastTouchFlushAt >= TOUCH_FLUSH_INTERVAL_SECONDS) {
+            flushTouchLocked();
+        }
+    }
+
+    /** 把累积的 lastUsedAt 变更立即落盘（关键状态变更路径会调用，保证注销前的时间戳不丢）。 */
+    private void flushTouchLocked() {
+        persistLocked();
+        lastTouchFlushAt = clock.epochSeconds();
     }
 
     /** 刷新令牌原文格式：{@code <familyId>.<32字节随机hex>}；familyId 部分只用于定位族，无敏感性。 */

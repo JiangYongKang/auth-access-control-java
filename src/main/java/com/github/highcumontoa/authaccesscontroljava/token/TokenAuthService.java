@@ -28,14 +28,17 @@ public class TokenAuthService {
 
     private final AccessTokenService accessTokenService;
     private final RefreshTokenStore refreshTokenStore;
+    private final SigningKeyRing signingKeyRing;
     private final AccountDirectory accounts;
     private final AuthProperties props;
     private final Clock clock;
 
     public TokenAuthService(AccessTokenService accessTokenService, RefreshTokenStore refreshTokenStore,
+                            SigningKeyRing signingKeyRing,
                             AccountDirectory accounts, AuthProperties props, Clock clock) {
         this.accessTokenService = accessTokenService;
         this.refreshTokenStore = refreshTokenStore;
+        this.signingKeyRing = signingKeyRing;
         this.accounts = accounts;
         this.props = props;
         this.clock = clock;
@@ -177,11 +180,17 @@ public class TokenAuthService {
             throw new RejectException(RejectReason.TOKEN_FAMILY_REVOKED,
                     "the token family was revoked; all tokens of this family are rejected");
         }
+        if (status == RefreshTokenStore.FamilyStatus.LOGGED_OUT) {
+            throw new RejectException(RejectReason.TOKEN_SESSION_LOGGED_OUT,
+                    "the session owning this token has been logged out; its access tokens are rejected");
+        }
         if (status != RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT) {
             // ACTIVE_STALE：令牌属于已被轮换掉的旧代；UNKNOWN：族不存在或已过期。
             throw new RejectException(RejectReason.TOKEN_FAMILY_STALE,
                     "access token is not from the current family generation (" + status + ")");
         }
+        // 认证路径上记录一次"最近使用"（仅更新会话概览时间戳；自检路径不调用此方法，不改变状态）。
+        refreshTokenStore.touch(claims.fam(), clock.epochSeconds());
 
         return new CurrentPrincipal(claims.sub(), claims.clientId(),
                 new HashSet<>(claims.roles()), new HashSet<>(claims.scopes()),
@@ -272,8 +281,19 @@ public class TokenAuthService {
                 now + props.getToken().getAccessTtlSeconds(),
                 generation,
                 roles,
-                scopes);
+                scopes,
+                signingKeyId());
         return accessTokenService.issue(claims);
+    }
+
+    /** 当前用于签发的密钥 ID（由密钥环决定）。 */
+    public String signingKeyId() {
+        return signingKeyRing.activeKey().id();
+    }
+
+    /** 供内部管理端点（自检）认证调用方客户端，与令牌端点采用相同的凭据校验。 */
+    public ClientApp authenticateManagementClient(String clientId, String clientSecret) {
+        return authenticateClient(clientId, clientSecret);
     }
 
     /** 供上层做"主体与请求资源是否相符"判定。 */
