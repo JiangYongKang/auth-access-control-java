@@ -160,7 +160,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
     }
 
     @Override
-    public synchronized void revoke(String familyId, String reason) {
+    public synchronized void revoke(String familyId, String reason, RevocationCause cause) {
         RefreshFamily family = families.get(familyId);
         if (family == null) {
             log.info("Revoke requested for unknown family: {}", familyId);
@@ -169,8 +169,10 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         if (!family.isRevoked()) {
             family.setRevoked(true);
             family.setRevokeReason(reason == null ? "explicit_revoke" : reason);
+            family.setRevocationCause(cause == null ? RevocationCause.TOKEN_REVOCATION : cause);
             persistLocked();
-            log.info("Refresh family revoked: family={}, reason={}", familyId, family.getRevokeReason());
+            log.info("Refresh family revoked: family={}, cause={}, reason={}",
+                    familyId, family.getRevocationCause(), family.getRevokeReason());
         }
     }
 
@@ -195,6 +197,52 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         return family.getGeneration() == generation
                 ? FamilyStatus.ACTIVE_CURRENT
                 : FamilyStatus.ACTIVE_STALE;
+    }
+
+    @Override
+    public synchronized FamilyRevocation familyRevocation(String familyId, long generation) {
+        RefreshFamily family = families.get(familyId);
+        if (family == null) {
+            return FamilyRevocation.of(FamilyStatus.UNKNOWN);
+        }
+        if (family.isRevoked()) {
+            return new FamilyRevocation(FamilyStatus.REVOKED, family.effectiveRevocationCause());
+        }
+        if (family.isExpiredAt(clock.epochSeconds())) {
+            // 族已过期等同于状态不可再确认，按"非当前"处理。
+            return FamilyRevocation.of(FamilyStatus.UNKNOWN);
+        }
+        return FamilyRevocation.of(family.getGeneration() == generation
+                ? FamilyStatus.ACTIVE_CURRENT
+                : FamilyStatus.ACTIVE_STALE);
+    }
+
+    @Override
+    public synchronized SessionRevokeOutcome revokeSessionAtomically(String familyId, String subject,
+                                                                     String reason, long nowEpochSeconds) {
+        RefreshFamily family = families.get(familyId);
+        // 族不存在或不属于发起主体：统一报 NOT_FOUND，不向调用方泄露其它主体会话的存在。
+        if (family == null || !subject.equals(family.getSubject())) {
+            log.info("Session revoke: session not found: family={}, subject={}", familyId, subject);
+            return SessionRevokeOutcome.NOT_FOUND;
+        }
+        if (family.isRevoked()) {
+            // 并发/重复注销的落败者都在这里汇合：第一次之后再无 REVOKED。
+            log.info("Session revoke: session already revoked: family={}", familyId);
+            return SessionRevokeOutcome.ALREADY_REVOKED;
+        }
+        if (family.isExpiredAt(nowEpochSeconds)) {
+            log.info("Session revoke: session expired: family={}, expiredAt={}, now={}",
+                    familyId, family.getExpiresAt(), nowEpochSeconds);
+            return SessionRevokeOutcome.EXPIRED;
+        }
+        // 检查通过：在同一把锁内立即撤销并落盘，随后到达的任何重复请求只能得到 ALREADY_REVOKED。
+        family.setRevoked(true);
+        family.setRevokeReason(reason == null ? "admin_session_logout" : reason);
+        family.setRevocationCause(RevocationCause.SESSION_LOGOUT);
+        persistLocked();
+        log.info("Session revoked atomically: family={}, subject={}", familyId, subject);
+        return SessionRevokeOutcome.REVOKED;
     }
 
     @Override
@@ -238,6 +286,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
             }
             family.setRevoked(true);
             family.setRevokeReason(reason == null ? "session_logout" : reason);
+            family.setRevocationCause(RevocationCause.SESSION_LOGOUT);
             changed = true;
             count++;
         }

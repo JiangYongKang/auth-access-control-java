@@ -3,10 +3,13 @@ package com.github.highcumontoa.authaccesscontroljava.tests;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.github.highcumontoa.authaccesscontroljava.config.AuthProperties;
+import com.github.highcumontoa.authaccesscontroljava.session.SessionService;
 import com.github.highcumontoa.authaccesscontroljava.support.Clock;
 import com.github.highcumontoa.authaccesscontroljava.token.FileRefreshTokenStore;
 import com.github.highcumontoa.authaccesscontroljava.token.RefreshFamily;
 import com.github.highcumontoa.authaccesscontroljava.token.RefreshTokenStore;
+import com.github.highcumontoa.authaccesscontroljava.token.RejectException;
+import com.github.highcumontoa.authaccesscontroljava.token.RejectReason;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -143,12 +146,81 @@ class SessionConcurrencyTest {
         pool.shutdown();
         assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
 
-        // 第一次撤销 10 个；之后并发的重复调用必须返回 0（不能重复计数/重复落盘）
+        // 第一次撤销 10 个；之后串行/并发的重复调用必须返回 0（不能重复计数/重复落盘）
         assertThat(store.revokeSessionsBySubject("u-alice", "logout_all")).isZero();
         assertThat(store.listActiveSessions("u-alice")).isEmpty();
         for (RefreshTokenStore.StoredToken s : sessions) {
             assertThat(store.familyStatus(s.familyId(), s.generation()))
                     .isEqualTo(RefreshTokenStore.FamilyStatus.REVOKED);
         }
+    }
+
+    @Test
+    void serviceLevelConcurrentLogoutSucceedsExactlyOnceAndRestAreNotFound() throws Exception {
+        Path file = Path.of("target/test-data/session-concurrent-service.json");
+        Files.createDirectories(file.toAbsolutePath().getParent());
+        Files.deleteIfExists(file);
+        FixedClock clock = new FixedClock(1_700_000_000L);
+        FileRefreshTokenStore store = newStore(file, clock);
+        SessionService sessions = new SessionService(store, clock);
+
+        var target = store.create("u-alice", "client-web", 3600, List.of("USER"), List.of("read"));
+        var keep = store.create("u-alice", "client-mobile", 3600, List.of("USER"), List.of("read"));
+        var otherSubject = store.create("u-bob", "client-web", 3600, List.of("USER"), List.of("read"));
+
+        int threads = 32;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger alreadyGone = new AtomicInteger();
+        AtomicInteger unexpected = new AtomicInteger();
+        for (int i = 0; i < threads; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    try {
+                        sessions.revokeSession("u-alice", target.familyId());
+                        success.incrementAndGet();
+                    } catch (RejectException ex) {
+                        if (ex.reason() == RejectReason.SESSION_NOT_FOUND) {
+                            alreadyGone.incrementAndGet();
+                        } else {
+                            unexpected.incrementAndGet();
+                        }
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+
+        // 恰好一次成功；其余全部明确告知「会话不存在或已注销」，且没有任何意料之外的错误
+        assertThat(success.get()).isEqualTo(1);
+        assertThat(alreadyGone.get()).isEqualTo(threads - 1);
+        assertThat(unexpected.get()).isZero();
+
+        // 注销即时生效：目标会话族为 REVOKED；同主体另一会话与 bob 的会话不受牵连
+        assertThat(store.familyStatus(target.familyId(), target.generation()))
+                .isEqualTo(RefreshTokenStore.FamilyStatus.REVOKED);
+        assertThat(store.familyStatus(keep.familyId(), keep.generation()))
+                .isEqualTo(RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT);
+        assertThat(store.familyStatus(otherSubject.familyId(), otherSubject.generation()))
+                .isEqualTo(RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT);
+        assertThat(store.listActiveSessions("u-alice"))
+                .extracting(RefreshFamily::getFamilyId).containsExactly(keep.familyId());
+
+        // 落线后的再次（串行重复）注销同样不能再成功
+        org.junit.jupiter.api.Assertions.assertThrows(RejectException.class,
+                () -> sessions.revokeSession("u-alice", target.familyId()));
+
+        // 不能借注销接口踢掉其它主体仍然有效的会话：keep 属于 u-alice，以 u-bob 身份注销应被拒绝
+        RejectException crossSubject = org.junit.jupiter.api.Assertions.assertThrows(RejectException.class,
+                () -> sessions.revokeSession("u-bob", keep.familyId()));
+        assertThat(crossSubject.reason()).isEqualTo(RejectReason.SESSION_NOT_FOUND);
+        assertThat(store.familyStatus(keep.familyId(), keep.generation()))
+                .isEqualTo(RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT);
     }
 }

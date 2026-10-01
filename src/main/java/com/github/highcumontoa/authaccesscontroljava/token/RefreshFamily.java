@@ -26,6 +26,12 @@ public class RefreshFamily {
     private long expiresAt;
     private boolean revoked;
     private String revokeReason;
+    /**
+     * 撤销的起因类别（显式令牌撤销 vs 会话注销），与 revoked 同时落盘。
+     * 旧版本写出的状态文件没有该字段，读取后为 null，由 {@link #effectiveRevocationCause()}
+     * 依据 revokeReason 兜底分类，保证升级后结论不退化。
+     */
+    private RevocationCause revocationCause;
     private List<String> roles;
     private List<String> scopes;
     /**
@@ -67,6 +73,24 @@ public class RefreshFamily {
 
     public String getRevokeReason() { return revokeReason; }
     public void setRevokeReason(String revokeReason) { this.revokeReason = revokeReason; }
+
+    public RevocationCause getRevocationCause() { return revocationCause; }
+    public void setRevocationCause(RevocationCause revocationCause) { this.revocationCause = revocationCause; }
+
+    /**
+     * 已撤销族的起因类别。新状态始终显式带类别；旧版本状态文件该字段缺失（null）时，
+     * 依据历史 revokeReason 文本兜底识别会话注销，识别不出的一律按显式令牌撤销处理
+     * （保守归类，避免把撤销误报成会话注销）。
+     */
+    public RevocationCause effectiveRevocationCause() {
+        if (revocationCause != null) {
+            return revocationCause;
+        }
+        if (revokeReason != null && revokeReason.contains("session")) {
+            return RevocationCause.SESSION_LOGOUT;
+        }
+        return RevocationCause.TOKEN_REVOCATION;
+    }
 
     public List<String> getRoles() { return roles == null ? List.of() : roles; }
     public void setRoles(List<String> roles) { this.roles = roles; }

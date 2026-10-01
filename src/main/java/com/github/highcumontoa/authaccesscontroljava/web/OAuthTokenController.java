@@ -78,35 +78,60 @@ public class OAuthTokenController {
     }
 
     /**
-     * 只读令牌自检（RFC 7662 风格）：先认证调用方客户端，再返回令牌当前是否有效及无效原因。
-     * 该端点不会改变任何令牌状态；乱填/畸形令牌得到 200 + active=false，而不是 5xx。
-     * 响应不含令牌原文与签名密钥。
+     * 只读令牌自检（RFC 7662 风格）：认证调用方客户端后，返回令牌当前是否有效及无效原因。
+     *
+     * <p>与内网网关的约定：该端点对「令牌层面」的任何输入都<b>不返回 4xx/5xx</b>——
+     * 没带令牌（字段缺失或为空）、乱填、畸形令牌，一律是 HTTP 200 + {@code active=false}，
+     * 用 {@code reason} 说明为什么无效；响应绝不回显令牌原文或任何密钥信息。
+     * 仅当请求确实携带了待检令牌时才要求客户端认证（沿用撤销端点的反匿名探测约定，
+     * 凭据错误仍为 401 {@code invalid_client}）。
      */
     @PostMapping("/oauth/introspect")
-    public Map<String, Object> introspect(@RequestBody(required = false) RevokeRequest request) {
-        if (request == null) {
-            throw new RejectException(RejectReason.INVALID_REQUEST, "JSON request body is required");
+    public Map<String, Object> introspect(@RequestBody(required = false) String rawBody) {
+        // 宽容解析请求体：body 缺失或不是合法 JSON 时都按「没带令牌」处理，绝不向网关抛 4xx。
+        RevokeRequest request = parseIntrospectBody(rawBody);
+        String token = request == null ? null : request.getToken();
+        if (token == null || token.isBlank()) {
+            log.info("Introspection without token: 200 active=false, reason=missing_token");
+            return inactiveBody("missing_token");
         }
+
         // 与撤销端点一致：必须先认证客户端，避免匿名探测。
         tokenAuthService.requireClient(request.getClient_id(), request.getClient_secret());
-        if (request.getToken() == null || request.getToken().isBlank()) {
-            throw new RejectException(RejectReason.INVALID_REQUEST, "token is required");
-        }
 
-        IntrospectionService.Result result = introspectionService.introspect(request.getToken());
+        IntrospectionService.Result result = introspectionService.introspect(token);
         log.info("Introspection processed: token={}, active={}, reason={}",
-                Maskers.maskToken(request.getToken()), result.active(), result.reason());
+                Maskers.maskToken(token), result.active(), result.reason());
 
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("active", result.active());
         if (!result.active()) {
-            body.put("reason", result.reason());
-            return body;
+            return inactiveBody(result.reason());
         }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("active", true);
         body.put("sub", result.subject());
         body.put("client_id", result.clientId());
         body.put("exp", result.exp());
         body.put("scope", result.scopes() == null ? "" : String.join(" ", result.scopes()));
         return body;
+    }
+
+    private static Map<String, Object> inactiveBody(String reason) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("active", false);
+        body.put("reason", reason);
+        return body;
+    }
+
+    /** 尽力把请求体解析成 {@link RevokeRequest}；任何失败（空体/非法 JSON/类型不符）都返回 null。 */
+    private static RevokeRequest parseIntrospectBody(String rawBody) {
+        if (rawBody == null || rawBody.isBlank()) {
+            return null;
+        }
+        try {
+            return com.github.highcumontoa.authaccesscontroljava.support.JsonCodec.mapper()
+                    .readValue(rawBody, RevokeRequest.class);
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

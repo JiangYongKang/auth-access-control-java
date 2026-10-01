@@ -8,6 +8,8 @@
 - 刷新令牌的**轮换（rotation）与撤销（revocation）**，并发/重复使用时**全进程最多成功一次**；
 - **用户会话可见、可定向踢除**：按用户列出会话概览、注销单个或全部会话，注销即时生效，重启一致；
 - 面向内网网关的**只读令牌自检入口**（RFC 7662 风格），细分各类无效原因；
+  **「令牌被撤销」(`token_revoked`) 与「会话被踢下线」(`session_revoked`) 明确分开**，
+  没带令牌/乱填令牌一律 HTTP 200 + `active:false` 而不是 4xx；
 - 按**角色 / 作用域 / 资源归属**的接口访问控制；
 - 主体维度**固定时间窗口限流**，高并发下精确不超量；
 - 所有拒绝原因都有**稳定、可区分的错误码**，结论可解释、可复现；
@@ -71,7 +73,7 @@ auth.security.hmac-key=${AUTH_HMAC_KEY:local-development-only-hmac-key-please-ch
 
 刷新令牌的撤销/轮换/会话状态需要跨重启保持，因此会写入本地状态文件
 （默认 `data/refresh-state.json`，已在 `.gitignore` 中忽略）。
-文件里**只有刷新令牌的 SHA-256 哈希、代际号、撤销标记与会话元数据时间戳，没有任何明文令牌或密钥**。
+文件里**只有刷新令牌的 SHA-256 哈希、代际号、撤销标记与撤销起因类别、会话元数据时间戳，没有任何明文令牌或密钥**。
 
 ---
 
@@ -132,8 +134,10 @@ auth.security.hmac-key=${AUTH_HMAC_KEY:local-development-only-hmac-key-please-ch
   - 同一刷新令牌**无论串行重放还是并发重复使用，全进程最多有一次成功**，其余得到 `invalid_grant_replayed`；
   - 旧刷新令牌立即失效；轮换产生的是**新的刷新令牌**，需要保存使用。
 - 每次轮换都会让**旧访问令牌失效**：访问令牌携带 `gen`，与族当前代不一致即被拒（`token_family_stale`）。
-- **撤销**：撤销作用于整个族（RFC 7009 风格）。撤销后该族的**所有**刷新令牌与历史访问令牌都被拒
-  （`invalid_grant_revoked` / `token_family_revoked`）。
+- **撤销**：撤销作用于整个族（RFC 7009 风格）。撤销时同时记录**起因类别**
+  （显式令牌撤销 `TOKEN_REVOCATION` / 会话注销 `SESSION_LOGOUT`）。撤销后该族的**所有**
+  刷新令牌与历史访问令牌都被拒（`invalid_grant_revoked` / `token_family_revoked`）；
+  令牌自检则据起因类别分别给出 `token_revoked` / `session_revoked`（见 §3.4）。
 - **进程重启一致性**：族状态（含 `revoked`、当前哈希、代际、角色/作用域）以 JSON 持久化，
   启动时加载。已撤销族不会被清理，保证重启后仍给出 `revoked` 而不是退化为「未知」。
   写盘采用「临时文件 + 原子 move」。
@@ -181,8 +185,16 @@ auth.security.hmac-key=${AUTH_HMAC_KEY:local-development-only-hmac-key-please-ch
 - 概览**不暴露任何访问/刷新令牌原文**，只有元数据。
 - **定向注销只影响目标会话**，同一用户的其它会话不受牵连；注销底层即「撤销该族」，
   因此该会话**此前已发出的访问令牌也立即失效**（受保护请求返回 `token_family_revoked`）。
-- 对不存在/已过期/已注销的会话再次注销，返回 404 `session_not_found`；
+- **重复/并发注销恰好成功一次**：「归属校验 → 状态判定 → 撤销落盘」在存储层同一把锁内
+  原子完成。无论是串行重复调用还是多请求并发注销同一个 `sessionId`，**只有第一次返回
+  200 `status=revoked`**；其余调用一律返回 **404 `session_not_found`**（消息会说明会话
+  不存在、已过期或「already been revoked」），不会再次报告成功。注销起因会随族状态持久化为
+  `SESSION_LOGOUT`，因此该会话令牌在自检中得到 `session_revoked`，与显式令牌撤销的
+  `token_revoked` 明确区分（见 §3.4）。
+- 对不存在/已过期/已注销的会话注销，返回 404 `session_not_found`；
   会话不属于该 `userId` 时同样按 `session_not_found` 处理，不向调用方泄露归属。
+- `POST /api/admin/sessions/{userId}`（注销全部）返回本次实际注销的数量 `revoked`；
+  全部已注销后再调用返回 `revoked: 0`，并发重复调用也不会重复计数。
 - `lastUsedAt` 仅用于展示：访问令牌通过认证、刷新成功都会更新它。为避免每个 API 请求都写盘，
   落盘做了约 60 秒节流（内存中实时、磁盘上近似），**它不参与任何安全判定**。
 - **重启一致性**：会话与撤销状态随族状态一起持久化（见 §3.2）。重启后，已建立且未过期的会话
@@ -204,11 +216,11 @@ auth.security.hmac-key=${AUTH_HMAC_KEY:local-development-only-hmac-key-please-ch
 { "active": true, "sub": "u-alice", "client_id": "client-web", "exp": 1700000600, "scope": "read write" }
 ```
 
-无效响应一律是 **HTTP 200 + `active:false`**（不抛 5xx），并用 `reason` 区分类别：
+无效响应一律是 **HTTP 200 + `active:false`**（不抛 4xx/5xx），并用 `reason` 区分类别：
 
 | reason | 含义 |
 | --- | --- |
-| `missing_token` | 没传 token |
+| `missing_token` | 没带 token：字段缺失、为空串/纯空白，或请求体缺失/不是合法 JSON |
 | `malformed` | 乱填/结构/编码/JSON 无法解析 |
 | `unsupported_alg` | `alg` 不是 HS256（含 `none`） |
 | `bad_signature` | 密钥认识但签名对不上（被篡改） |
@@ -216,11 +228,24 @@ auth.security.hmac-key=${AUTH_HMAC_KEY:local-development-only-hmac-key-please-ch
 | `missing_claims` | 缺少必需声明 |
 | `expired` | 已过期 |
 | `issuer_mismatch` | 签发者不符 |
-| `session_revoked` | 所属会话/族已被撤销或会话被注销 |
-| `family_stale` | 属于被轮换掉的旧代，或族未知 |
+| `token_revoked` | **令牌本身被显式撤销**（`/oauth/revoke`） |
+| `session_revoked` | **所属会话被踢下线/注销**（会话管理端点） |
+| `family_stale` | 属于被轮换掉的旧代，或族未知/已过期 |
+
+其中 `token_revoked` 与 `session_revoked` 是**两个明确分开的原因**：底层族虽然都进入 revoked
+状态，但撤销时会持久化记录「起因类别」（`TOKEN_REVOCATION` / `SESSION_LOGOUT`），
+自检与受保护请求各自据此给出结论，网关可按不同策略处置（例如会话注销可能触发重新登录，
+令牌撤销则按安全事件处理）。升级自旧版本的状态文件缺少该字段时，会按历史撤销原因文本
+兜底分类，识别不出的一律保守归为 `token_revoked`，结论不会退化成「无法区分」。
+
+**「没带令牌」约定（网关按 200 解析，务必注意）**：只要请求里没有可检的令牌——`token`
+字段缺失、为空串或纯空白，乃至整个请求体为空/不是合法 JSON——端点都返回
+`200 {"active":false,"reason":"missing_token"}`，**不会**返回 4xx 参数错误，也不会回显
+令牌原文或任何密钥信息；乱填、格式不对的令牌同样是 200 + 对应原因。仅当请求确实携带了
+待检令牌时才要求客户端认证，凭据错误仍为 401 `invalid_client`。
 
 性质：该入口**只读**——不轮换、不撤销、不更新 `lastUsedAt`，多次自检不改变令牌有效性；
-客户端凭据错误返回 401 `invalid_client`；响应**不回显令牌原文、不泄露任何签名密钥**。
+响应**不回显令牌原文、不泄露任何签名密钥**。
 
 ---
 
@@ -304,6 +329,22 @@ curl -s -X POST http://localhost:8080/oauth/introspect -H 'Content-Type: applica
 # -> {"active":true,"sub":"u-alice",...}
 # 乱填令牌 -> 200 {"active":false,"reason":"malformed"}；篡改 -> reason=bad_signature
 
+# 12b) 没带令牌（字段缺失/为空/请求体非法）：一律 200 active=false，而不是 4xx
+curl -s -X POST http://localhost:8080/oauth/introspect -H 'Content-Type: application/json' \
+  -d '{"client_id":"client-web","client_secret":"web-secret"}'
+# -> {"active":false,"reason":"missing_token"}
+curl -s -X POST http://localhost:8080/oauth/introspect -H 'Content-Type: application/json' \
+  -d '{not-json'
+# -> {"active":false,"reason":"missing_token"}
+
+# 12c) 显式撤销令牌 vs 会话注销：自检原因明确分开
+curl -s -X POST http://localhost:8080/oauth/revoke -H 'Content-Type: application/json' \
+  -d "{\"client_id\":\"client-web\",\"client_secret\":\"web-secret\",\"token\":\"$AT\"}"
+curl -s -X POST http://localhost:8080/oauth/introspect -H 'Content-Type: application/json' \
+  -d "{\"client_id\":\"client-web\",\"client_secret\":\"web-secret\",\"token\":\"$AT\"}"
+# -> {"active":false,"reason":"token_revoked"}        # 令牌本身被撤销
+# 若改为管理员注销会话（下面第 13 步），同一族的令牌自检则是 reason=session_revoked
+
 # 13) 会话管理（用 admin 登录拿管理令牌 ADMIN_AT）
 ADMIN_RESP=$(curl -s -X POST http://localhost:8080/oauth/token -H 'Content-Type: application/json' \
   -d '{"grant_type":"password","client_id":"client-web","client_secret":"web-secret",
@@ -317,6 +358,13 @@ curl -s http://localhost:8080/api/admin/sessions/u-alice -H "Authorization: Bear
 curl -s -X POST http://localhost:8080/api/admin/sessions/u-alice/<sid> \
   -H "Authorization: Bearer $ADMIN_AT"
 # 注销后该会话的访问令牌：401 token_family_revoked；自检：active=false,reason=session_revoked
+
+# 对同一个 <sid> 再注销一次（或并发连发多次）：只有第一次 200，其余 404 session_not_found
+curl -i -s -X POST http://localhost:8080/api/admin/sessions/u-alice/<sid> \
+  -H "Authorization: Bearer $ADMIN_AT"
+# 第一次：HTTP/1.1 200  {"status":"revoked",...}
+# 其余：  HTTP/1.1 404  {"error":"session_not_found",...}（会话已不存在或已注销）
+# 同主体其它会话不受影响；已发出的访问令牌在注销成功的瞬间即被拒绝
 
 # 一次性注销 alice 全部会话
 curl -s -X POST http://localhost:8080/api/admin/sessions/u-alice \
@@ -368,20 +416,20 @@ AUTH_HMAC_KEY="stable-key" mvn spring-boot:run
 mvn test
 ```
 
-共 63 个测试，全部可在无外部服务、无真实凭据条件下运行：
+共 73 个测试，全部可在无外部服务、无真实凭据条件下运行：
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
 | `MaskersTest` | 令牌/密钥脱敏不泄露原文、指纹稳定不可逆 |
 | `AccessTokenServiceTest` | 过期、载荷/签名篡改、`none`/异算法、缺声明、签发者不符、异密钥——错误码逐一区分 |
 | `SigningKeyRotationTest` | 多密钥签发带 kid、轮换期间旧密钥兼容、摘除旧密钥即 `unknown_signing_key`、与 `bad_signature` 区分、非法多密钥配置 fail-fast |
-| `RefreshTokenStoreTest` | 轮换、32 线程并发恰一次成功、未知/客户端不符/过期/撤销可区分、状态文件只含哈希、重启重载 |
-| `SessionConcurrencyTest` | 多客户端登录形成独立会话、32 线程并发注销单个会话即时且幂等、并发注销全部对每个会话仅一次、不牵连他人 |
-| `IntrospectionServiceTest` | 自检有效/无效（畸形、过期、篡改、未知族、撤销）原因区分、乱填不抛异常、只读不改状态 |
+| `RefreshTokenStoreTest` | 轮换、32 线程并发恰一次成功、未知/客户端不符/过期/撤销可区分、状态文件只含哈希、重启重载；撤销起因类别持久化与重启可辨、原子会话注销恰好一次（已注销/未知/跨主体/过期各有明确结果） |
+| `SessionConcurrencyTest` | 多客户端登录形成独立会话、32 线程并发注销单个会话即时且幂等、并发注销全部对每个会话仅一次、不牵连他人；**服务层 32 线程并发注销同一会话恰好一次成功、其余全部 `session_not_found`**、串行重复注销与跨主体注销防护 |
+| `IntrospectionServiceTest` | 自检有效/无效（畸形、过期、篡改、未知族、旧代、未知 kid、缺声明、异签发者、`alg=none`）原因逐一区分、**`token_revoked` 与 `session_revoked` 绝不合并**、乱填不抛异常、只读不改状态、旧状态文件缺少起因字段时兜底分类不退化 |
 | `RateLimitServiceTest` | 固定窗口上限、主体隔离、窗口翻转、500 线程恰好不超量 |
 | `AuthFlowIntegrationTest` | 全栈：登录、缺/畸形令牌、篡改、主体不符、角色、作用域、归属、刷新轮换与重放、撤销 |
 | `KeyRotationIntegrationTest` | 真实多上下文：k1→k2 切换保留 k1 旧令牌可用、摘掉 k1 立即 `unknown_signing_key` |
-| `SessionAdminIntegrationTest` | 会话列表不含令牌原文、定向注销即时失效、全部注销、自检端到端各类原因、匿名自检 401 |
+| `SessionAdminIntegrationTest` | 会话列表不含令牌原文、定向注销即时失效、全部注销、自检端到端各类原因、匿名自检 401；**显式撤销→`token_revoked` 与会话注销→`session_revoked` 端到端可辨、没带令牌/空体/非法 JSON 一律 200 `missing_token`（含不泄密校验）、16 路并发 HTTP 重复注销恰好一次 200 其余 404** |
 | `SessionRestartTest` | 真实双上下文：重启后会话仍在、已注销保持注销、旧令牌依旧 `token_family_revoked` |
 | `RateLimitIntegrationTest` | HTTP 端到端恰好 10 个通过、第 11 个 429 |
 | `ExpiryIntegrationTest` | 可控时钟推进后访问令牌 `token_expired`（无需真实等待） |

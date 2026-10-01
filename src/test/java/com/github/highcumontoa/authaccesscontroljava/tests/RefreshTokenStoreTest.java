@@ -189,4 +189,68 @@ class RefreshTokenStoreTest {
         assertThat(store.familyStatus("nonexistent", 0))
                 .isEqualTo(RefreshTokenStore.FamilyStatus.UNKNOWN);
     }
+
+    @Test
+    void familyRevocationReportsPersistedCauseAndSurvivesRestart(@TempDir Path dir) {
+        Path file = dir.resolve("state.json");
+        var clock = new FixedClock(1_700_000_000L);
+        var store = new FileRefreshTokenStore(props(file), clock);
+        var tokenRevoked = store.create("u-alice", "client-web", 3600, List.of(), List.of("read"));
+        var loggedOut = store.create("u-alice", "client-web", 3600, List.of(), List.of("read"));
+
+        store.revoke(tokenRevoked.familyId(), "explicit_revoke:unspecified");
+        store.revoke(loggedOut.familyId(), "admin_session_logout",
+                com.github.highcumontoa.authaccesscontroljava.token.RevocationCause.SESSION_LOGOUT);
+
+        assertThat(store.familyRevocation(tokenRevoked.familyId(), 0).status())
+                .isEqualTo(RefreshTokenStore.FamilyStatus.REVOKED);
+        assertThat(store.familyRevocation(tokenRevoked.familyId(), 0).cause())
+                .isEqualTo(com.github.highcumontoa.authaccesscontroljava.token.RevocationCause.TOKEN_REVOCATION);
+        assertThat(store.familyRevocation(loggedOut.familyId(), 0).cause())
+                .isEqualTo(com.github.highcumontoa.authaccesscontroljava.token.RevocationCause.SESSION_LOGOUT);
+        // 非撤销状态不附带起因
+        var active = store.create("u-bob", "client-web", 3600, List.of(), List.of());
+        assertThat(store.familyRevocation(active.familyId(), 0).cause()).isNull();
+
+        // 起因类别随状态文件持久化，重启后仍可区分
+        var restarted = new FileRefreshTokenStore(props(file), clock);
+        assertThat(restarted.familyRevocation(tokenRevoked.familyId(), 0).cause())
+                .isEqualTo(com.github.highcumontoa.authaccesscontroljava.token.RevocationCause.TOKEN_REVOCATION);
+        assertThat(restarted.familyRevocation(loggedOut.familyId(), 0).cause())
+                .isEqualTo(com.github.highcumontoa.authaccesscontroljava.token.RevocationCause.SESSION_LOGOUT);
+    }
+
+    @Test
+    void atomicSessionRevokeWinsExactlyOnceAndIsScopedToSubject(@TempDir Path dir) {
+        var clock = new FixedClock(1_700_000_000L);
+        var store = new FileRefreshTokenStore(props(dir.resolve("state.json")), clock);
+        var target = store.create("u-alice", "client-web", 3600, List.of("USER"), List.of("read"));
+
+        // 第一次：真正撤销
+        assertThat(store.revokeSessionAtomically(target.familyId(), "u-alice",
+                "admin_session_logout", clock.epochSeconds()))
+                .isEqualTo(RefreshTokenStore.SessionRevokeOutcome.REVOKED);
+        // 第二次（串行重复）：明确告知已注销，而不是再次成功
+        assertThat(store.revokeSessionAtomically(target.familyId(), "u-alice",
+                "admin_session_logout", clock.epochSeconds()))
+                .isEqualTo(RefreshTokenStore.SessionRevokeOutcome.ALREADY_REVOKED);
+        // 起因类别被记为会话注销
+        assertThat(store.familyRevocation(target.familyId(), 0).cause())
+                .isEqualTo(com.github.highcumontoa.authaccesscontroljava.token.RevocationCause.SESSION_LOGOUT);
+        // 族未知 / 主体不符 -> NOT_FOUND
+        assertThat(store.revokeSessionAtomically("no-such-family", "u-alice",
+                "admin_session_logout", clock.epochSeconds()))
+                .isEqualTo(RefreshTokenStore.SessionRevokeOutcome.NOT_FOUND);
+        assertThat(store.revokeSessionAtomically(target.familyId(), "u-bob",
+                "admin_session_logout", clock.epochSeconds()))
+                .isEqualTo(RefreshTokenStore.SessionRevokeOutcome.NOT_FOUND);
+
+        // 已过期会话 -> EXPIRED
+        var expiring = store.create("u-alice", "client-web", 10, List.of("USER"), List.of());
+        clock.advance(11);
+        assertThat(store.revokeSessionAtomically(expiring.familyId(), "u-alice",
+                "admin_session_logout", clock.epochSeconds()))
+                .isEqualTo(RefreshTokenStore.SessionRevokeOutcome.EXPIRED);
+        clock.advance(-11);
+    }
 }

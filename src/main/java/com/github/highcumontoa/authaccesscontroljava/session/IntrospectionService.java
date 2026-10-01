@@ -6,6 +6,7 @@ import com.github.highcumontoa.authaccesscontroljava.token.AccessTokenService;
 import com.github.highcumontoa.authaccesscontroljava.token.RefreshTokenStore;
 import com.github.highcumontoa.authaccesscontroljava.token.RejectException;
 import com.github.highcumontoa.authaccesscontroljava.token.RejectReason;
+import com.github.highcumontoa.authaccesscontroljava.token.RevocationCause;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,8 +21,10 @@ import org.springframework.stereotype.Service;
  *   <li><b>只读</b>：不做轮换、不撤销、不写任何状态，也不更新会话的「最近使用」时间；</li>
  *   <li><b>不抛异常</b>：乱填、格式错误、无法解析的令牌一律得到 {@code active=false} 而非 5xx；</li>
  *   <li><b>不泄密</b>：结果只含主体/客户端/过期时间等非敏感元数据，绝不回显令牌原文或签名密钥；</li>
- *   <li>无效原因细分：malformed / unsupported_alg / bad_signature / unknown_signing_key /
- *       missing_claims / expired / issuer_mismatch / session_revoked / family_stale。</li>
+ *   <li>无效原因细分：missing_token / malformed / unsupported_alg / bad_signature /
+ *       unknown_signing_key / missing_claims / expired / issuer_mismatch /
+ *       token_revoked（令牌本身被显式撤销）/ session_revoked（会话被注销导致令牌失效）/
+ *       family_stale（旧代或族未知/已过期）。token_revoked 与 session_revoked 必须分别可辨。</li>
  * </ul>
  */
 @Service
@@ -77,13 +80,18 @@ public class IntrospectionService {
         }
 
         // 令牌自身合法，再判定会话/族状态（与会话注销、轮换、撤销保持同一结论）。
-        RefreshTokenStore.FamilyStatus status =
-                refreshTokenStore.familyStatus(claims.fam(), claims.gen());
-        if (status == RefreshTokenStore.FamilyStatus.REVOKED) {
-            // 该族被撤销：可能是显式 revoke，也可能是会话被注销——对网关呈现为「会话被注销」。
-            return Result.invalid("session_revoked");
+        // 单次加锁快照同时拿到状态与撤销起因，避免两次查询之间状态变化导致结论错配。
+        RefreshTokenStore.FamilyRevocation revocation =
+                refreshTokenStore.familyRevocation(claims.fam(), claims.gen());
+        if (revocation.status() == RefreshTokenStore.FamilyStatus.REVOKED) {
+            // 同样是族撤销，起因必须分开呈现：显式令牌撤销 vs 会话被踢下线。
+            String reason = revocation.cause() == RevocationCause.SESSION_LOGOUT
+                    ? "session_revoked"
+                    : "token_revoked";
+            return Result.invalid(reason);
         }
-        if (status != RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT) {
+        if (revocation.status() != RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT) {
+            // ACTIVE_STALE：被轮换掉的旧代；UNKNOWN：族不存在或已过期。
             return Result.invalid("family_stale");
         }
 
