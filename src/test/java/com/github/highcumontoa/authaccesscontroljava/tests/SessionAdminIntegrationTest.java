@@ -7,6 +7,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.github.highcumontoa.authaccesscontroljava.support.JsonCodec;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -120,6 +125,69 @@ class SessionAdminIntegrationTest {
     }
 
     @Test
+    void concurrentRevokeOfSameSessionSucceedsExactlyOnceOverHttp() throws Exception {
+        String admin = login("admin", "admin-pass-123");
+        String t1 = login("alice", "alice-pass-123");
+        String t2 = login("alice", "alice-pass-123");
+        String sid1 = famOf(t1);
+        String sid2 = famOf(t2);
+
+        int threads = 16;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger ok = new AtomicInteger();
+        AtomicInteger notFound = new AtomicInteger();
+        for (int i = 0; i < threads; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    int code = mvc.perform(post("/api/admin/sessions/u-alice/" + sid1)
+                                    .header("Authorization", "Bearer " + admin))
+                            .andReturn().getResponse().getStatus();
+                    if (code == 200) {
+                        ok.incrementAndGet();
+                    } else if (code == 404) {
+                        notFound.incrementAndGet();
+                    }
+                } catch (Exception ignored) {
+                    // 仅统计 200/404；其它状态视为失败，最终断言会暴露
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        org.junit.jupiter.api.Assertions.assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+
+        // 恰好一次 200 成功，其余明确 404 session_not_found
+        org.junit.jupiter.api.Assertions.assertEquals(1, ok.get());
+        org.junit.jupiter.api.Assertions.assertEquals(threads - 1, notFound.get());
+
+        // 被注销会话的访问令牌立即失效；同主体另一个会话依旧可用
+        mvc.perform(get("/api/ping").header("Authorization", "Bearer " + t1))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("token_family_revoked"));
+        mvc.perform(get("/api/ping").header("Authorization", "Bearer " + t2))
+                .andExpect(status().isOk());
+
+        // 自检两种起因可辨：被注销会话 -> session_revoked
+        mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"client_id":"client-web","client_secret":"web-secret","token":"%s"}"""
+                                .formatted(t1)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("session_revoked"));
+
+        // 注销 sid2 不依赖 sid1 的状态；注销全部后其令牌也失效
+        mvc.perform(post("/api/admin/sessions/u-alice").header("Authorization", "Bearer " + admin))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revoked").value(1));
+        mvc.perform(get("/api/ping").header("Authorization", "Bearer " + t2))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("token_family_revoked"));
+    }
+
+    @Test
     void introspectDistinguishesActiveExpiredRevokedAndMalformed() throws Exception {
         String token = login("bob", "bob-pass-123");
 
@@ -152,7 +220,7 @@ class SessionAdminIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.reason").value("bad_signature"));
 
-        // 撤销后自检：session_revoked；且不回显令牌原文
+        // 撤销后自检：token_revoked（与会话注销的 session_revoked 明确区分）；且不回显令牌原文
         MvcResult revoked = mvc.perform(post("/oauth/revoke").contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"client_id":"client-web","client_secret":"web-secret","token":"%s"}"""
@@ -167,7 +235,7 @@ class SessionAdminIntegrationTest {
                                 .formatted(token)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.active").value(false))
-                .andExpect(jsonPath("$.reason").value("session_revoked"));
+                .andExpect(jsonPath("$.reason").value("token_revoked"));
 
         // 客户端密钥错误：401，不允许匿名自检
         mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
@@ -176,5 +244,52 @@ class SessionAdminIntegrationTest {
                                 .formatted(token)))
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.error").value("invalid_client"));
+    }
+
+    @Test
+    void introspectWithoutTokenReturns200InactiveMissingTokenNot4xx() throws Exception {
+        String clientCreds = "\"client_id\":\"client-web\",\"client_secret\":\"web-secret\"";
+
+        // token 字段缺失
+        MvcResult missing = mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("{" + clientCreds + "}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("missing_token"))
+                .andReturn();
+        // 不回显任何令牌原文/密钥信息
+        org.junit.jupiter.api.Assertions.assertFalse(
+                missing.getResponse().getContentAsString().contains("web-secret"));
+
+        // token 为 null
+        mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("{" + clientCreds + ",\"token\":null}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("missing_token"));
+
+        // token 为空串 / 纯空白（最后一个用 JSON 转义，解析后得到 tab+换行）
+        mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("{" + clientCreds + ",\"token\":\"\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("missing_token"));
+        mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("{" + clientCreds + ",\"token\":\"   \"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("missing_token"));
+        mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("{" + clientCreds + ",\"token\":\"\\t\\n\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("missing_token"));
+
+        // 乱填 / 格式不对的令牌同样是 200 无效结论，而不是 4xx/5xx
+        mvc.perform(post("/oauth/introspect").contentType(MediaType.APPLICATION_JSON)
+                        .content("{" + clientCreds + ",\"token\":\"not.a.jwt\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(false))
+                .andExpect(jsonPath("$.reason").value("malformed"));
     }
 }

@@ -12,8 +12,28 @@ public interface RefreshTokenStore {
     StoredToken create(String subject, String clientId, long ttlSeconds,
                         java.util.List<String> roles, java.util.List<String> scopes);
 
-    /** 撤销族。 */
+    /**
+     * 撤销族（令牌端点显式撤销，起因记为 {@link RevocationCause#TOKEN_REVOCATION}）。
+     * 幂等：族不存在或已撤销时不做任何事，也不改写既有撤销起因。
+     */
     void revoke(String familyId, String reason);
+
+    /**
+     * 原子地「检查—注销」单个会话：仅当族存在、属于 {@code subject}、未撤销且未过期时，
+     * 才在同一把锁内完成撤销（起因记为 {@link RevocationCause#SESSION_LOGOUT}）。
+     *
+     * <p>因此并发或重复注销同一会话时，全进程<b>恰好一次</b>返回 true；
+     * 其余调用（会话不存在 / 不属于该主体 / 已注销 / 已过期）返回 false。
+     *
+     * @return true 仅当本次调用真正执行了注销
+     */
+    boolean revokeSession(String familyId, String subject, String reason);
+
+    /**
+     * 查询族的撤销起因；族不存在或未撤销时返回 null。
+     * 历史落盘记录缺少起因字段时，实现按 {@link RevocationCause#TOKEN_REVOCATION} 解释。
+     */
+    RevocationCause revocationCause(String familyId);
 
     Optional<RefreshFamily> findByFamilyId(String familyId);
 
@@ -44,4 +64,15 @@ public interface RefreshTokenStore {
     }
 
     enum FamilyStatus { ACTIVE_CURRENT, ACTIVE_STALE, REVOKED, UNKNOWN }
+
+    /**
+     * 族被撤销的起因，持久化在族记录上，自检据此把「令牌本身被撤销」与
+     * 「会话被踢下线导致令牌失效」明确区分为两种无效原因。
+     */
+    enum RevocationCause {
+        /** 令牌端点显式撤销（RFC 7009 /oauth/revoke）。 */
+        TOKEN_REVOCATION,
+        /** 会话管理端点注销会话（踢下线）。 */
+        SESSION_LOGOUT
+    }
 }

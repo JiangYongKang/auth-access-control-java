@@ -189,4 +189,37 @@ class RefreshTokenStoreTest {
         assertThat(store.familyStatus("nonexistent", 0))
                 .isEqualTo(RefreshTokenStore.FamilyStatus.UNKNOWN);
     }
+
+    @Test
+    void revocationCausePersistsAndLegacyRevokedRecordsDefaultToTokenRevocation(@TempDir Path dir)
+            throws Exception {
+        Path file = dir.resolve("state.json");
+        FixedClock clock = new FixedClock(1_700_000_000L);
+        FileRefreshTokenStore store = new FileRefreshTokenStore(props(file), clock);
+        var byToken = store.create("u-alice", "client-web", 3600, List.of(), List.of("read"));
+        var bySession = store.create("u-bob", "client-web", 3600, List.of(), List.of("read"));
+        store.revoke(byToken.familyId(), "explicit_revoke:access_token");
+        assertThat(store.revokeSession(bySession.familyId(), "u-bob", "admin_session_logout"))
+                .isTrue();
+
+        // 重启后起因仍可辨
+        FileRefreshTokenStore restarted = new FileRefreshTokenStore(props(file), clock);
+        assertThat(restarted.revocationCause(byToken.familyId()))
+                .isEqualTo(RefreshTokenStore.RevocationCause.TOKEN_REVOCATION);
+        assertThat(restarted.revocationCause(bySession.familyId()))
+                .isEqualTo(RefreshTokenStore.RevocationCause.SESSION_LOGOUT);
+        assertThat(restarted.revocationCause("missing-family")).isNull();
+
+        // 历史版本落盘的记录没有 revocationCause 字段：revoked=true 时按显式令牌撤销解释
+        String legacy = Files.readString(file)
+                .replace(",\n  \"revocationCause\" : \"TOKEN_REVOCATION\"", "")
+                .replace(",\n  \"revocationCause\" : \"SESSION_LOGOUT\"", "");
+        assertThat(legacy).doesNotContain("revocationCause");
+        Files.writeString(file, legacy);
+        FileRefreshTokenStore legacyStore = new FileRefreshTokenStore(props(file), clock);
+        assertThat(legacyStore.revocationCause(byToken.familyId()))
+                .isEqualTo(RefreshTokenStore.RevocationCause.TOKEN_REVOCATION);
+        assertThat(legacyStore.revocationCause(bySession.familyId()))
+                .isEqualTo(RefreshTokenStore.RevocationCause.TOKEN_REVOCATION);
+    }
 }

@@ -18,7 +18,8 @@ import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-/** 自检对有效/无效令牌的区分：原因码逐一可辨；乱填令牌不抛异常；自检不改变令牌状态。 */
+/** 自检对有效/无效令牌的区分：原因码逐一可辨（含 token_revoked 与 session_revoked 分开）；
+ * 乱填令牌不抛异常；自检不改变令牌状态。 */
 class IntrospectionServiceTest {
 
     static final String ISSUER = "intro-issuer";
@@ -111,16 +112,79 @@ class IntrospectionServiceTest {
     }
 
     @Test
-    void revokedSessionIsReportedSessionRevoked() {
+    void unknownSigningKeyUnsupportedAlgAndBadSignatureRemainDistinct() {
+        // 阶段一：k1 签发
+        AuthProperties before = multiKeyProps(
+                java.util.Map.of("k1", "intro-key-one", "k2", "intro-key-two"), "k1");
+        AccessTokenService k1Tokens = new AccessTokenService(new HmacSigner(before), clock);
+        var stored = store.create("u-alice", "client-web", 3600,
+                List.of("USER"), List.of("read"));
+        String tokenK1 = k1Tokens.issue(new AccessTokenClaims(ISSUER, "u-alice", "local-resource-api",
+                "jti-k1", "client-web", stored.familyId(), now, now + 600, stored.generation(),
+                List.of("USER"), List.of("read")));
+
+        // 阶段二：摘掉 k1，只剩 k2 -> unknown_signing_key（与 bad_signature 不同）
+        AuthProperties after = multiKeyProps(java.util.Map.of("k2", "intro-key-two"), "k2");
+        AccessTokenService k2Tokens = new AccessTokenService(new HmacSigner(after), clock);
+        IntrospectionService introAfter = new IntrospectionService(k2Tokens, store, after);
+        assertThat(introAfter.introspect(tokenK1).reason()).isEqualTo("unknown_signing_key");
+
+        // alg 被改成 none（结构合法）-> unsupported_alg
+        String headerNone = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString("{\"alg\":\"none\",\"typ\":\"JWT\",\"kid\":\"k2\"}".getBytes());
+        String[] k1Parts = tokenK1.split("\\.");
+        String noneToken = headerNone + "." + k1Parts[1] + "." + k1Parts[2];
+        assertThat(introAfter.introspect(noneToken).reason()).isEqualTo("unsupported_alg");
+
+        // k2 仍在配置中但签名被篡改 -> bad_signature，不与 unknown_signing_key 合并
+        var stored2 = store.create("u-carol", "client-web", 3600,
+                List.of("USER"), List.of("read"));
+        String tokenK2 = k2Tokens.issue(new AccessTokenClaims(ISSUER, "u-carol", "local-resource-api",
+                "jti-k2", "client-web", stored2.familyId(), now, now + 600, stored2.generation(),
+                List.of("USER"), List.of("read")));
+        String[] parts = tokenK2.split("\\.");
+        char last = parts[2].charAt(parts[2].length() - 1);
+        String flippedSig = parts[2].substring(0, parts[2].length() - 1) + (last == 'A' ? 'B' : 'A');
+        assertThat(introAfter.introspect(parts[0] + "." + parts[1] + "." + flippedSig).reason())
+                .isEqualTo("bad_signature");
+    }
+
+    private AuthProperties multiKeyProps(java.util.Map<String, String> keys, String active) {
+        AuthProperties p = new AuthProperties();
+        p.getSecurity().setIssuer(ISSUER);
+        p.getSecurity().setKeys(new java.util.LinkedHashMap<>(keys));
+        p.getSecurity().setActiveKeyId(active);
+        return p;
+    }
+
+    @Test
+    void explicitTokenRevocationIsReportedTokenRevoked() {
         var stored = store.create("u-alice", "client-web", 3600,
                 List.of("USER"), List.of("read"));
         String token = validTokenForFamily(stored.familyId(), stored.generation());
         assertThat(introspection.introspect(token).active()).isTrue();
 
-        store.revoke(stored.familyId(), "admin_session_logout");
+        // 令牌端点显式撤销（/oauth/revoke）
+        store.revoke(stored.familyId(), "explicit_revoke:access_token");
+        IntrospectionService.Result after = introspection.introspect(token);
+        assertThat(after.active()).isFalse();
+        assertThat(after.reason()).isEqualTo("token_revoked");
+    }
+
+    @Test
+    void sessionLogoutIsReportedSessionRevokedAndKeptDistinctFromTokenRevocation() {
+        var stored = store.create("u-alice", "client-web", 3600,
+                List.of("USER"), List.of("read"));
+        String token = validTokenForFamily(stored.familyId(), stored.generation());
+        assertThat(introspection.introspect(token).active()).isTrue();
+
+        // 会话被管理端注销（踢下线）：与令牌显式撤销是两个不同的 reason
+        boolean revoked = store.revokeSession(stored.familyId(), "u-alice", "admin_session_logout");
+        assertThat(revoked).isTrue();
         IntrospectionService.Result after = introspection.introspect(token);
         assertThat(after.active()).isFalse();
         assertThat(after.reason()).isEqualTo("session_revoked");
+        assertThat(after.reason()).isNotEqualTo("token_revoked");
     }
 
     @Test

@@ -21,7 +21,9 @@ import org.springframework.stereotype.Service;
  *   <li><b>不抛异常</b>：乱填、格式错误、无法解析的令牌一律得到 {@code active=false} 而非 5xx；</li>
  *   <li><b>不泄密</b>：结果只含主体/客户端/过期时间等非敏感元数据，绝不回显令牌原文或签名密钥；</li>
  *   <li>无效原因细分：malformed / unsupported_alg / bad_signature / unknown_signing_key /
- *       missing_claims / expired / issuer_mismatch / session_revoked / family_stale。</li>
+ *       missing_claims / expired / issuer_mismatch / token_revoked / session_revoked / family_stale。
+ *       其中「令牌本身被显式撤销」(token_revoked) 与「会话被注销导致令牌失效」
+ *       (session_revoked) 是两个互不混淆的原因，网关可据此采取不同策略。</li>
  * </ul>
  */
 @Service
@@ -80,8 +82,16 @@ public class IntrospectionService {
         RefreshTokenStore.FamilyStatus status =
                 refreshTokenStore.familyStatus(claims.fam(), claims.gen());
         if (status == RefreshTokenStore.FamilyStatus.REVOKED) {
-            // 该族被撤销：可能是显式 revoke，也可能是会话被注销——对网关呈现为「会话被注销」。
-            return Result.invalid("session_revoked");
+            // 同样是「族已撤销」，按持久化的撤销起因把两种情形明确分开：
+            //  - 令牌端点显式撤销（/oauth/revoke）         -> token_revoked
+            //  - 会话被管理端注销/踢下线（含注销全部）      -> session_revoked
+            RefreshTokenStore.RevocationCause cause =
+                    refreshTokenStore.revocationCause(claims.fam());
+            String reason = cause == RefreshTokenStore.RevocationCause.SESSION_LOGOUT
+                    ? "session_revoked"
+                    : "token_revoked";
+            log.debug("Introspection: token inactive, reason={}", reason);
+            return Result.invalid(reason);
         }
         if (status != RefreshTokenStore.FamilyStatus.ACTIVE_CURRENT) {
             return Result.invalid("family_stale");

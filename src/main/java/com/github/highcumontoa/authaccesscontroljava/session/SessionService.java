@@ -1,6 +1,5 @@
 package com.github.highcumontoa.authaccesscontroljava.session;
 
-import com.github.highcumontoa.authaccesscontroljava.support.Clock;
 import com.github.highcumontoa.authaccesscontroljava.token.RefreshFamily;
 import com.github.highcumontoa.authaccesscontroljava.token.RefreshTokenStore;
 import com.github.highcumontoa.authaccesscontroljava.token.RejectException;
@@ -24,11 +23,9 @@ public class SessionService {
     private static final Logger log = LoggerFactory.getLogger(SessionService.class);
 
     private final RefreshTokenStore store;
-    private final Clock clock;
 
-    public SessionService(RefreshTokenStore store, Clock clock) {
+    public SessionService(RefreshTokenStore store) {
         this.store = store;
-        this.clock = clock;
     }
 
     /** 列出某主体当前有效会话（不暴露任何令牌原文）。 */
@@ -39,30 +36,23 @@ public class SessionService {
     }
 
     /**
-     * 定向注销单个会话。仅当该会话存在且属于该主体时执行，避免跨主体注销。
-     * 注销后该会话已发出的访问令牌立即失效；同主体的其它会话不受影响。
+     * 定向注销单个会话。底层在存储层同一把锁内原子完成「归属/存在性检查 + 撤销」：
+     * <ul>
+     *   <li>仅当会话存在、属于该主体、未注销且未过期时返回成功；</li>
+     *   <li>并发或重复注销同一会话时，恰好一次成功，其余抛出 {@code SESSION_NOT_FOUND}
+     *       （会话不存在 / 已被注销 / 已过期 / 不属于该主体，对外统一不泄露归属）；</li>
+     *   <li>只撤销目标族，同主体的其它会话不受牵连；注销后该会话已发出的访问令牌立即失效。</li>
+     * </ul>
      */
     public void revokeSession(String subject, String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             throw new RejectException(RejectReason.INVALID_REQUEST, "sessionId is required");
         }
-        RefreshFamily family = store.findByFamilyId(sessionId)
-                .orElseThrow(() -> new RejectException(RejectReason.SESSION_NOT_FOUND,
-                        "session does not exist: " + sessionId));
-        if (!subject.equals(family.getSubject())) {
-            // 不向调用方泄露其它主体会话的存在
+        boolean revoked = store.revokeSession(sessionId, subject, "admin_session_logout");
+        if (!revoked) {
             throw new RejectException(RejectReason.SESSION_NOT_FOUND,
-                    "session does not exist: " + sessionId);
+                    "session does not exist or has already been revoked: " + sessionId);
         }
-        if (family.isRevoked()) {
-            throw new RejectException(RejectReason.SESSION_NOT_FOUND,
-                    "session has already been revoked: " + sessionId);
-        }
-        if (family.isExpiredAt(clock.epochSeconds())) {
-            throw new RejectException(RejectReason.SESSION_NOT_FOUND,
-                    "session has expired: " + sessionId);
-        }
-        store.revoke(sessionId, "admin_session_logout");
         log.info("Session revoked: sessionId={}, subject={}", sessionId, subject);
     }
 

@@ -79,7 +79,8 @@ public class OAuthTokenController {
 
     /**
      * 只读令牌自检（RFC 7662 风格）：先认证调用方客户端，再返回令牌当前是否有效及无效原因。
-     * 该端点不会改变任何令牌状态；乱填/畸形令牌得到 200 + active=false，而不是 5xx。
+     * 该端点不会改变任何令牌状态；乱填/畸形令牌、字段缺失或为空的 token，一律得到
+     * 200 + active=false 与可区分的 reason，绝不抛 4xx/5xx（网关按 200 解析）。
      * 响应不含令牌原文与签名密钥。
      */
     @PostMapping("/oauth/introspect")
@@ -89,13 +90,17 @@ public class OAuthTokenController {
         }
         // 与撤销端点一致：必须先认证客户端，避免匿名探测。
         tokenAuthService.requireClient(request.getClient_id(), request.getClient_secret());
-        if (request.getToken() == null || request.getToken().isBlank()) {
-            throw new RejectException(RejectReason.INVALID_REQUEST, "token is required");
-        }
 
-        IntrospectionService.Result result = introspectionService.introspect(request.getToken());
-        log.info("Introspection processed: token={}, active={}, reason={}",
-                Maskers.maskToken(request.getToken()), result.active(), result.reason());
+        // token 字段缺失或为空属于「令牌为什么无效」，而不是调用方参数错误：
+        // 按文档约定一律返回 200 + active=false + missing_token，绝不回显令牌原文。
+        String token = request.getToken();
+        IntrospectionService.Result result = introspectionService.introspect(token);
+        if (token == null || token.isBlank()) {
+            log.info("Introspection processed without token: active=false, reason=missing_token");
+        } else {
+            log.info("Introspection processed: token={}, active={}, reason={}",
+                    Maskers.maskToken(token), result.active(), result.reason());
+        }
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("active", result.active());

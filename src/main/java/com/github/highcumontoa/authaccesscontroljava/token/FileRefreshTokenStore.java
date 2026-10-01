@@ -23,7 +23,8 @@ import org.springframework.stereotype.Repository;
  * <p>关键性质：
  * <ul>
  *   <li>所有变更方法均在同一把锁内完成"检查—变更—落盘"，因此并发/重复使用同一刷新令牌时，
- *       全进程最多只有一次 SUCCESS，其余线程看到的一定是旧哈希，得到 REPLAYED。</li>
+ *       全进程最多只有一次 SUCCESS，其余线程看到的一定是旧哈希，得到 REPLAYED；
+ *       并发/重复注销同一会话时也恰好只有一次返回 true，其余得到 false（会话已不存在/已注销）。</li>
  *   <li>落盘只写 {@code currentTokenHash}（SHA-256），刷新令牌原文从不出现在磁盘上。</li>
  *   <li>每次落盘采用"写临时文件 + 原子 move"，避免半写文件；进程重启后重新加载，
  *       撤销（revoked）等结论保持一致。</li>
@@ -169,9 +170,48 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
         if (!family.isRevoked()) {
             family.setRevoked(true);
             family.setRevokeReason(reason == null ? "explicit_revoke" : reason);
+            family.setRevocationCause(RevocationCause.TOKEN_REVOCATION);
             persistLocked();
             log.info("Refresh family revoked: family={}, reason={}", familyId, family.getRevokeReason());
         }
+    }
+
+    @Override
+    public synchronized boolean revokeSession(String familyId, String subject, String reason) {
+        RefreshFamily family = families.get(familyId);
+        if (family == null) {
+            // 不向调用方泄露其它主体会话是否存在：统一表现为「没有可注销的会话」。
+            log.info("Session logout requested for unknown family: {}", familyId);
+            return false;
+        }
+        if (!subject.equals(family.getSubject())) {
+            log.info("Session logout rejected: subject mismatch, family={}", familyId);
+            return false;
+        }
+        if (family.isRevoked() || family.isExpiredAt(clock.epochSeconds())) {
+            // 已注销 / 已过期：本次没有真正注销任何东西。
+            return false;
+        }
+        // 检查与撤销在同一把 synchronized 锁内完成：并发重复注销最多一个线程走到这里。
+        family.setRevoked(true);
+        family.setRevokeReason(reason == null ? "admin_session_logout" : reason);
+        family.setRevocationCause(RevocationCause.SESSION_LOGOUT);
+        persistLocked();
+        log.info("Session logged out: family={}, subject={}, reason={}",
+                familyId, subject, family.getRevokeReason());
+        return true;
+    }
+
+    @Override
+    public synchronized RevocationCause revocationCause(String familyId) {
+        RefreshFamily family = families.get(familyId);
+        if (family == null || !family.isRevoked()) {
+            return null;
+        }
+        // 历史落盘记录没有起因字段：旧版本撤销只能来自令牌端点，按显式令牌撤销解释。
+        return family.getRevocationCause() == null
+                ? RevocationCause.TOKEN_REVOCATION
+                : family.getRevocationCause();
     }
 
     @Override
@@ -238,6 +278,7 @@ public class FileRefreshTokenStore implements RefreshTokenStore {
             }
             family.setRevoked(true);
             family.setRevokeReason(reason == null ? "session_logout" : reason);
+            family.setRevocationCause(RevocationCause.SESSION_LOGOUT);
             changed = true;
             count++;
         }
